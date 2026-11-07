@@ -1,0 +1,38 @@
+{
+  "name": "@creator/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "npm run db:generate && tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/api.test.ts src/database/*.test.ts",
+    "db:setup": "tsx src/setup.ts",
+    "start": "node dist/server.js",
+    "db:generate": "tsx src/database/generate.ts",
+    "db:backup:sqlite": "tsx src/database/backup-sqlite.ts",
+    "db:migrate": "tsx src/database/migrate.ts",
+    "db:inspect": "tsx src/database/migrate.ts --inspect-source",
+    "db:backup:postgres": "tsx src/database/backup-postgres.ts",
+    "db:fix-runtime-password": "node --import tsx src/database/fix-runtime-password.ts",
+    "owner:prepare": "node --import tsx src/execution/prepare-owner.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@prisma/client": "^6.19.0",
+    "dotenv": "^17.2.0",
+    "fastify": "^5.6.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.15",
+    "@electric-sql/pglite-socket": "^0.2.18",
+    "@types/node": "^24.0.0",
+    "prisma": "^6.19.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -1,0 +1,307 @@
+diff --git a/apps/api/src/execution/jobs.ts b/apps/api/src/execution/jobs.ts
+index 8c6103c..de6fbbf 100644
+--- a/apps/api/src/execution/jobs.ts
++++ b/apps/api/src/execution/jobs.ts
+@@ -1,9 +1,10 @@
++import {NATIVE_EXECUTION_RELEASE_APPROVED} from './release.js';
+ import {randomUUID} from 'node:crypto';
+ import {z} from 'zod';
+ import {makeContract,contractSchema,contractDigest,type ExecutionContract} from './contract.js';
+ import {containsSecret,resultSchema,type ExecutionResult} from './adapter.js';
+ import type {Owner} from './owner.js';
+-import {isReviewedFakeLauncher} from './launcher.js';
++import {isReviewedFakeLauncher,isReviewedNativeLauncher} from './launcher.js';
+ export interface Sql { $queryRawUnsafe<T=unknown>(sql:string,...args:any[]):Promise<T>; $executeRawUnsafe(sql:string,...args:any[]):Promise<number> }
+ export interface JobDatabase extends Sql {$transaction<T>(fn:(tx:Sql)=>Promise<T>,options?:{maxWait:number;timeout:number}):Promise<T>}
+ const metaSchema=z.object({version:z.literal(2),source:z.enum(['codex','simulation']),contract:contractSchema,digest:z.string(),approvalId:z.string(),approval:z.object({actor:z.literal('owner'),sessionAudit:z.string(),digest:z.string(),expiresAt:z.string().datetime(),decidedAt:z.string().datetime()}).nullable(),worker:z.object({token:z.string().uuid(),leaseUntil:z.string().datetime(),startedAt:z.string().datetime()}).nullable(),cancelRequested:z.boolean(),result:resultSchema.nullable(),error:z.string().regex(/^[A-Z_]+$/).nullable()}).strict();
+@@ -29,11 +30,19 @@ async function snapshot(tx:Sql,taskId:string,lock=false){
+  if(containsSecret(s.title+'\n'+s.description+'\n'+s.instructions))failure('EXECUTION_INPUT_REJECTED',400);
+  return makeContract({taskId:s.id,title:s.title,description:s.description,studio:s.studio,agentId:'director'},s.instructions);
+ }
+-async function save(tx:Sql,j:Job){await tx.$executeRawUnsafe('UPDATE creator_hq."ExecutionJob" SET status=$2,metadata=$3::jsonb,"updatedAt"=CURRENT_TIMESTAMP WHERE id=$1',j.id,j.status,JSON.stringify(j.metadata));j.updatedAt=await now(tx);}
+-export interface JobLauncher {readonly kind:'disabled'|'fake';execute(c:ExecutionContract,approval:{id:string;jobId:string;actorType:'human';actorId:'owner';digest:string;decision:'approved';expiresAt:number},signal:AbortSignal):Promise<ExecutionResult>}
++async function save(tx:Sql,j:Job){await tx.$executeRawUnsafe('UPDATE creator_hq."ExecutionJob" SET status=$2,metadata=$3::jsonb,enabled=$4,"updatedAt"=CURRENT_TIMESTAMP WHERE id=$1',j.id,j.status,JSON.stringify(j.metadata),j.enabled);j.updatedAt=await now(tx);}
++export interface JobLauncher {readonly kind:'disabled'|'fake'|'native';execute(c:ExecutionContract,approval:{id:string;jobId:string;actorType:'human';actorId:'owner';digest:string;decision:'approved';expiresAt:number},signal:AbortSignal):Promise<ExecutionResult>}
++export async function executionSchemaReady(tx:Sql){
++  const [row]=await tx.$queryRawUnsafe<{ready:boolean}[]>('SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=\'creator_hq."ExecutionJob"\'::regclass AND conname=\'ExecutionJob_atlas_text_check\' AND convalidated) AND NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=\'creator_hq."ExecutionJob"\'::regclass AND conname=\'ExecutionJob_disabled_check\') AND EXISTS(SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=\'creator_hq."ExecutionJob"\'::regclass AND c.relname=\'ExecutionJob_single_running_idx\' AND i.indisunique AND i.indisvalid) AS ready');return row?.ready===true;
++}
+ export class ExecutionJobs {
+- constructor(private readonly db:JobDatabase,private readonly launcher:JobLauncher){if(launcher.kind==='fake'&&(!isReviewedFakeLauncher(launcher)||process.env.NODE_ENV!=='test'))throw Error('EXECUTION_FAKE_TEST_ONLY');}
++ constructor(private readonly db:JobDatabase,private readonly launcher:JobLauncher){if(launcher.kind==='fake'&&(!isReviewedFakeLauncher(launcher)||process.env.NODE_ENV!=='test'))throw Error('EXECUTION_FAKE_TEST_ONLY');if(launcher.kind==='native'&&!isReviewedNativeLauncher(launcher))throw Error('EXECUTION_NATIVE_REVIEW_REQUIRED');}
+  private tx<T>(fn:(t:Sql)=>Promise<T>){return this.db.$transaction(fn,options);}
++ private async activationReady(tx:Sql){
++  if(!NATIVE_EXECUTION_RELEASE_APPROVED||this.launcher.kind!=='native')return false;
++  return executionSchemaReady(tx);
++ }
++ async availability(){if(!NATIVE_EXECUTION_RELEASE_APPROVED||this.launcher.kind!=='native')return false;return this.tx(tx=>this.activationReady(tx));}
+  async create(taskId:string,requestId:string,owner:Owner){return this.tx(async tx=>{await mutex(tx);const contract=await snapshot(tx,taskId,true),digest=contractDigest(contract);
+   const existing=await tx.$queryRawUnsafe<{id:string}[]>('SELECT id FROM creator_hq."ExecutionJob" WHERE id=$1',requestId);
+   if(existing.length){const j=await readJob(tx,requestId);if(j.taskId!==taskId||j.metadata.digest!==digest)failure('EXECUTION_REQUEST_CONFLICT');return this.publicJob(tx,j);}
+@@ -51,19 +60,20 @@ export class ExecutionJobs {
+  });}
+  private async publicJob(tx:Sql,j:Job){let current=false;try{current=contractDigest(await snapshot(tx,j.taskId))===j.metadata.digest}catch(error){if(!(error instanceof JobFailure))throw error}
+   const approval=j.metadata.approval;const time=await now(tx);const [{status:approvalStatus}]=await tx.$queryRawUnsafe<{status:string}[]>('SELECT status FROM creator_hq."Approval" WHERE id=$1',j.metadata.approvalId);
+-  return {id:j.id,taskId:j.taskId,agentId:j.agentId,studio:j.metadata.contract.scope.studio,status:j.status,source:j.metadata.source,enabled:false,executionAvailable:false,digest:j.metadata.digest,contract:j.metadata.contract,approval:{id:j.metadata.approvalId,status:approvalStatus,valid:current&&!!approval&&approvalStatus==='Approved'&&Date.parse(approval.expiresAt)>time.getTime(),actor:approval?.actor??null},cancelRequested:j.metadata.cancelRequested,result:j.metadata.result,error:j.metadata.error,createdAt:j.createdAt,updatedAt:j.updatedAt,leaseExpired:!!j.metadata.worker&&Date.parse(j.metadata.worker.leaseUntil)<=time.getTime()};
++  return {id:j.id,taskId:j.taskId,agentId:j.agentId,studio:j.metadata.contract.scope.studio,status:j.status,source:j.metadata.source,enabled:j.enabled,executionAvailable:await this.activationReady(tx),digest:j.metadata.digest,contract:j.metadata.contract,approval:{id:j.metadata.approvalId,status:approvalStatus,valid:current&&!!approval&&approvalStatus==='Approved'&&Date.parse(approval.expiresAt)>time.getTime(),actor:approval?.actor??null},cancelRequested:j.metadata.cancelRequested,result:j.metadata.result,error:j.metadata.error,createdAt:j.createdAt,updatedAt:j.updatedAt,leaseExpired:!!j.metadata.worker&&Date.parse(j.metadata.worker.leaseUntil)<=time.getTime()};
+  }
+  async get(id:string){return this.tx(async tx=>this.publicJob(tx,await readJob(tx,id)));}
+  async list(){return this.tx(async tx=>{const rows=await tx.$queryRawUnsafe<{id:string}[]>('SELECT id FROM creator_hq."ExecutionJob" WHERE metadata->>\'version\'=\'2\' ORDER BY "createdAt" DESC LIMIT 50');return Promise.all(rows.map(async r=>this.publicJob(tx,await readJob(tx,r.id))));});}
+  async cancel(id:string,owner:Owner){return this.tx(async tx=>{await mutex(tx);const j=await readJob(tx,id,true);if(!['awaiting_approval','planned','running'].includes(j.status))failure('EXECUTION_JOB_TERMINAL');j.metadata.cancelRequested=true;if(j.status!=='running'){j.status='cancelled';await tx.$executeRawUnsafe('UPDATE creator_hq."Approval" SET status=\'Rejected\' WHERE id=$1 AND status=\'Pending\'',j.metadata.approvalId);}await save(tx,j);return this.publicJob(tx,j);});}
+  async claim(id:string){
+   // Production jobs cannot be claimed while the release gate and DB enabled constraint remain closed.
+-  if(this.launcher.kind!=='fake')failure('REAL_EXECUTION_DISABLED',423);
+-  return this.tx(async tx=>{await mutex(tx);const active=await tx.$queryRawUnsafe<{id:string}[]>('SELECT id FROM creator_hq."ExecutionJob" WHERE status=\'running\' AND metadata->>\'version\'=\'2\' LIMIT 1');if(active.length)failure('EXECUTION_WORKER_BUSY');
+-   const j=await readJob(tx,id,true);if(j.metadata.source!=='simulation'||j.enabled||j.status!=='planned'||j.metadata.worker)failure('EXECUTION_ALREADY_STARTED');
++  if(this.launcher.kind!=='fake'&&(!NATIVE_EXECUTION_RELEASE_APPROVED||this.launcher.kind!=='native'))failure('REAL_EXECUTION_DISABLED',423);
++  const native=this.launcher.kind==='native';
++  return this.tx(async tx=>{await mutex(tx);if(native&&!await this.activationReady(tx))failure('EXECUTION_SCHEMA_NOT_READY',423);const active=await tx.$queryRawUnsafe<{id:string}[]>('SELECT id FROM creator_hq."ExecutionJob" WHERE status=\'running\' AND metadata->>\'version\'=\'2\' LIMIT 1');if(active.length)failure('EXECUTION_WORKER_BUSY');
++   const j=await readJob(tx,id,true);if(j.metadata.source!==(native?'codex':'simulation')||j.enabled||j.status!=='planned'||j.metadata.worker)failure('EXECUTION_ALREADY_STARTED');
+    const time=await now(tx),approval=j.metadata.approval;const [a]=await tx.$queryRawUnsafe<{status:string}[]>('SELECT status FROM creator_hq."Approval" WHERE id=$1 FOR UPDATE',j.metadata.approvalId);
+    if(!approval||a?.status!=='Approved'||approval.digest!==j.metadata.digest||Date.parse(approval.expiresAt)<=time.getTime()||contractDigest(await snapshot(tx,j.taskId,true))!==approval.digest||j.metadata.cancelRequested)failure('EXECUTION_APPROVAL_STALE');
+-   j.status='running';j.metadata.worker={token:randomUUID(),startedAt:time.toISOString(),leaseUntil:new Date(time.getTime()+90000).toISOString()};await save(tx,j);return j;
++   j.enabled=native;j.status='running';j.metadata.worker={token:randomUUID(),startedAt:time.toISOString(),leaseUntil:new Date(time.getTime()+90000).toISOString()};await save(tx,j);return j;
+   });
+  }
+  async complete(id:string,token:string,result:unknown,errorCode?:string){return this.tx(async tx=>{await mutex(tx);const j=await readJob(tx,id,true),time=await now(tx);if(j.status!=='running'||j.metadata.worker?.token!==token||Date.parse(j.metadata.worker.leaseUntil)<=time.getTime())failure('EXECUTION_WORKER_OWNERSHIP_LOST');
+@@ -72,7 +82,7 @@ export class ExecutionJobs {
+    const reportId=randomUUID();await tx.$executeRawUnsafe('INSERT INTO creator_hq."AgentReport"(id,"sourceId","agentId","taskId","approvalId",source,status,"summaryData","originalTechnicalReport","createdAt") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_TIMESTAMP)',reportId,'execution:'+j.id,j.agentId,j.taskId,j.metadata.approvalId,j.metadata.source,parsed.data.outcome==='needs_approval'?'awaiting_approval':'completed',JSON.stringify({template:'execution_result',...parsed.data}),JSON.stringify({jobId:j.id,source:j.metadata.source,result:parsed.data}));
+    await tx.$executeRawUnsafe('INSERT INTO creator_hq."Activity"(id,"agentId",message,simulated,"createdAt") VALUES($1,$2,$3,$4,CURRENT_TIMESTAMP)',randomUUID(),j.agentId,'Execution job completed: '+j.id,j.metadata.source==='simulation');
+    await tx.$executeRawUnsafe('UPDATE creator_hq."Task" SET status=\'Review\',"updatedAt"=CURRENT_TIMESTAMP WHERE id=$1',j.taskId);
+-  }await save(tx,j);return this.publicJob(tx,j);
++  }j.enabled=false;await save(tx,j);return this.publicJob(tx,j);
+  });}
+  async run(id:string){const j=await this.claim(id),token=j.metadata.worker!.token,controller=new AbortController();let polling=false;const poll=setInterval(async()=>{if(polling)return;polling=true;try{const current=await this.get(id);if(current.cancelRequested||current.leaseExpired)controller.abort()}catch{controller.abort()}finally{polling=false}},500);const timeout=setTimeout(()=>controller.abort(),j.metadata.contract.timeoutMs);
+   try{const a=j.metadata.approval!;const result=await this.launcher.execute(j.metadata.contract,{id:j.metadata.approvalId,jobId:j.id,actorType:'human',actorId:'owner',decision:'approved',digest:a.digest,expiresAt:Date.parse(a.expiresAt)},controller.signal);return await this.complete(id,token,result)}catch(error){if(error instanceof JobFailure)throw error;return await this.complete(id,token,null,controller.signal.aborted?'EXECUTION_ABORTED':'EXECUTION_FAILED')}finally{clearInterval(poll);clearTimeout(timeout)}
+diff --git a/apps/api/src/execution/launcher.ts b/apps/api/src/execution/launcher.ts
+index afc34de..0f57d4c 100644
+--- a/apps/api/src/execution/launcher.ts
++++ b/apps/api/src/execution/launcher.ts
+@@ -10,8 +10,10 @@ import type {JobLauncher} from './jobs.js';
+ import {StringDecoder} from 'node:string_decoder';
+ 
+ // A code-review/release gate, never an HTTP or environment switch in Package 4.
+-const REAL_CODEX_EXECUTION_ENABLED:boolean=false;
++import {NATIVE_EXECUTION_RELEASE_APPROVED} from './release.js';
+ const reviewedFakes=new WeakSet<object>();
++const reviewedNative=new WeakSet<object>();
++export function isReviewedNativeLauncher(value:object){return reviewedNative.has(value);}
+ export function isReviewedFakeLauncher(value:object){return reviewedFakes.has(value);}
+ export function fakeJobLauncher(factory:(contract:ExecutionContract)=>FakeProcess):JobLauncher {
+  const adapter=new FakeCodexAdapter();const launcher:JobLauncher=Object.freeze({kind:'fake',async execute(contract:ExecutionContract,approval:ExecutionApproval,signal:AbortSignal){const response=await adapter.execute({jobId:approval.jobId,contract,loadApproval:()=>approval,process:factory(contract),signal});if(!response.result)throw Error('EXECUTION_FAKE_FAILED');return response.result;}});reviewedFakes.add(launcher);return launcher;
+@@ -80,10 +82,10 @@ export function protocolTestLauncher(plan:Plan,fixture:ProtocolFixture):JobLaunc
+  const launcher:JobLauncher=Object.freeze({kind:'fake',async execute(contract:ExecutionContract,approval:ExecutionApproval,signal:AbortSignal){verifyApproval(contract,approval.jobId,approval);if(signal.aborted)throw Error('CODEX_CANCELLED');await verifyVersion(plan,signal,createChild);await inspectNative(plan,signal,createChild);if(signal.aborted)throw Error('CODEX_CANCELLED');return executeNative(plan,contract,signal,createChild)}});reviewedFakes.add(launcher);return launcher;
+ }
+ export class NativeCodexLauncher implements JobLauncher {
+- readonly kind='disabled' as const;
+- constructor(private readonly settings?:RuntimeSettings){}
++ get kind():'native'|'disabled'{return NATIVE_EXECUTION_RELEASE_APPROVED&&this.settings?'native':'disabled'}
++ constructor(private readonly settings?:RuntimeSettings){reviewedNative.add(this);}
+  async execute(contract:ExecutionContract,_approval:ExecutionApproval,signal:AbortSignal):Promise<ExecutionResult>{
+-  if(!REAL_CODEX_EXECUTION_ENABLED)throw Error('REAL_EXECUTION_DISABLED');
++  if(!NATIVE_EXECUTION_RELEASE_APPROVED)throw Error('REAL_EXECUTION_DISABLED');
+   if(process.platform!=='win32'||!this.settings)throw Error('CODEX_WINDOWS_CONFIGURATION_REQUIRED');
+   verifyApproval(contract,_approval.jobId,_approval);
+   assertNormalWindowsUser();
+diff --git a/apps/api/src/execution/routes.ts b/apps/api/src/execution/routes.ts
+index f028797..b806ac4 100644
+--- a/apps/api/src/execution/routes.ts
++++ b/apps/api/src/execution/routes.ts
+@@ -11,7 +11,7 @@ export async function executionRoutes(app:FastifyInstance,jobs:ExecutionJobs|nul
+  app.get('/execution/session',async(req,reply)=>{try{const session=sessions.authenticate(req.headers.cookie);return {authenticated:true,csrf:session.csrf}}catch(e){return error(reply,e)}});
+  app.delete('/execution/session',async(req,reply)=>{try{owner(req,true);sessions.logout(req.headers.cookie);reply.header('set-cookie',cookie+'; HttpOnly; SameSite=Strict; Path=/execution; Max-Age=0');return {authenticated:false}}catch(e){return error(reply,e)}});
+  const store=()=>{if(!jobs)throw new JobFailure('EXECUTION_POSTGRES_REQUIRED',503);return jobs;};
+- app.get('/execution/jobs',async(req,reply)=>{try{owner(req);return {enabled:false,jobs:await store().list()}}catch(e){return error(reply,e)}});
++ app.get('/execution/jobs',async(req,reply)=>{try{owner(req);return {enabled:await store().availability(),jobs:await store().list()}}catch(e){return error(reply,e)}});
+  app.get('/execution/jobs/:id',async(req,reply)=>{try{owner(req);return await store().get(z.string().uuid().parse((req.params as any).id))}catch(e){return error(reply,e)}});
+  app.post('/execution/jobs',async(req,reply)=>{const p=z.object({taskId:z.string().min(1).max(100),requestId:z.string().uuid()}).strict().safeParse(req.body);if(!p.success)return reply.code(400).send({code:'EXECUTION_INPUT_INVALID'});try{const actor=owner(req,true);const result=await store().create(p.data.taskId,p.data.requestId,actor);return reply.code(201).send(result)}catch(e){return error(reply,e)}});
+  app.post('/execution/jobs/:id/decision',async(req,reply)=>{const p=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),decision:z.enum(['Approved','Rejected'])}).strict().safeParse(req.body);if(!p.success)return reply.code(400).send({code:'EXECUTION_INPUT_INVALID'});try{return await store().decide(z.string().uuid().parse((req.params as any).id),p.data.digest,p.data.decision,owner(req,true))}catch(e){return error(reply,e)}});
+diff --git a/apps/api/src/app.ts b/apps/api/src/app.ts
+index 160e746..1b6b05f 100644
+--- a/apps/api/src/app.ts
++++ b/apps/api/src/app.ts
+@@ -1,3 +1,4 @@
++import {NATIVE_EXECUTION_RELEASE_APPROVED} from './execution/release.js';
+ import Fastify from 'fastify';
+ import cors from '@fastify/cors';
+ import { z } from 'zod';
+@@ -21,7 +22,7 @@ export async function buildApp(options:{database?:typeof defaultDb;provider?:'sq
+  app.addHook('onRequest',async(req,reply)=>{if(req.headers.origin && !['http://127.0.0.1:3000','http://localhost:3000'].includes(req.headers.origin)) return reply.code(403).send({error:'Origin not allowed',code:'ORIGIN_NOT_ALLOWED'});});
+  app.setErrorHandler((err,req,reply)=>{if(err instanceof z.ZodError) return reply.code(400).send({error:err.issues.map(i=>i.message).join('; '),code:'VALIDATION_ERROR',issues:err.issues.map(i=>({path:i.path,code:i.code}))}); const e=err as {code?:string;statusCode?:number}; if(e.code==='P2025') return reply.code(404).send({error:'Record not found',code:'RECORD_NOT_FOUND'});if(isDatabaseUnavailable(err))return reply.code(503).send({error:'Database unavailable',code:'DATABASE_UNAVAILABLE'});req.log.error({code:databaseErrorCode(err)??'INTERNAL_ERROR'},'Request failed');return reply.code(e.statusCode??500).send({error:e.statusCode===400?'Invalid request':'Internal error',code:e.statusCode===400?'INVALID_REQUEST':'INTERNAL_ERROR'});});
+  const probeHealth=createHealthProbe(async()=>{if(typeof db.$connect==='function')await db.$connect();await db.$queryRaw`SELECT 1`},options.healthTimeoutMs??healthBudgetMs(process.env));
+- app.get('/health',async(req,reply)=>{try{await probeHealth();return {status:'ok',execution:'disabled',database:options.provider??databaseProvider}}catch(error){if(isDatabaseUnavailable(error)||(error as {code?:string})?.code==='HEALTH_TIMEOUT')return reply.code(503).send({status:'unavailable',execution:'disabled',code:'DATABASE_UNAVAILABLE'});throw error}});
++ app.get('/health',async(req,reply)=>{try{await probeHealth();return {status:'ok',execution:NATIVE_EXECUTION_RELEASE_APPROVED?'atlas_text_release':'disabled',database:options.provider??databaseProvider}}catch(error){if(isDatabaseUnavailable(error)||(error as {code?:string})?.code==='HEALTH_TIMEOUT')return reply.code(503).send({status:'unavailable',execution:'disabled',code:'DATABASE_UNAVAILABLE'});throw error}});
+  app.addHook('preHandler',async(req,reply)=>{if(process.env.DATABASE_READ_ONLY==='true'&&['POST','PATCH','PUT','DELETE'].includes(req.method))return reply.code(503).send({error:'Migration read-only mode',code:'MIGRATION_READ_ONLY'})});
+  // Prisma 6 query wrapping drops initialization errorCode; explicit connect preserves it.
+  // Never retry the request or queue a failed write when connectivity is restored.
+diff --git a/apps/api/src/database/migrate.ts b/apps/api/src/database/migrate.ts
+index b4b2a6b..c978b7c 100644
+--- a/apps/api/src/database/migrate.ts
++++ b/apps/api/src/database/migrate.ts
+@@ -10,6 +10,7 @@ import {readSnapshot,digest,type Snapshot} from './snapshot.js';
+ import {inspectPostgresSecurity} from './preflight.js';
+ import {transferSnapshot} from './transfer.js';
+ import {checkConnectionAccess} from './connection.js';
++import {assertReviewedMigrationHistory,assertReviewedMigrationFiles} from './migration-history.js';
+ const args=new Set(process.argv.slice(2));
+ async function main(){
+  if(args.has('--check-connection')&&['--apply-schema','--apply-data','--probe-write'].some(flag=>args.has(flag)))throw new Error('READ_ONLY_CONNECTION_MODE_REQUIRED');
+@@ -19,13 +20,14 @@ async function main(){
+  const {PrismaClient,prismaTarget}=await import('./target.js');
+  if(args.has('--apply-schema')){
+   if(process.env.MIGRATION_SCHEMA_APPROVED!=='true')throw new Error('SCHEMA_APPROVAL_REQUIRED');
++  assertReviewedMigrationFiles('prisma/postgresql/migrations');
+   const inspection=new PrismaClient({datasources:{db:{url:migration.url}},log:[],errorFormat:'minimal'});
+   try{
+    const objects=await inspection.$queryRawUnsafe<{tablename:string}[]>("SELECT tablename FROM pg_tables WHERE schemaname='creator_hq'");
+    if(objects.length&&!objects.some(row=>row.tablename==='_prisma_migrations'))throw new Error('EXISTING_SCHEMA_REVIEW_REQUIRED');
+    if(objects.some(row=>row.tablename==='_prisma_migrations')){
+-    const history=await inspection.$queryRawUnsafe<{migration_name:string;finished_at:Date|null;rolled_back_at:Date|null}[]>('SELECT migration_name,finished_at,rolled_back_at FROM creator_hq._prisma_migrations');
+-    if(history.some(row=>row.migration_name!=='20261106000100_phase12_initial'||!row.finished_at||row.rolled_back_at))throw new Error('MIGRATION_HISTORY_REVIEW_REQUIRED');
++    const history=await inspection.$queryRawUnsafe<{migration_name:string;checksum:string;finished_at:Date|null;rolled_back_at:Date|null}[]>('SELECT migration_name,checksum,finished_at,rolled_back_at FROM creator_hq._prisma_migrations');
++    assertReviewedMigrationHistory(history);
+    }
+   }finally{await inspection.$disconnect()}
+   // Prisma deploy uses the schema's directUrl. It never invokes reset or db push.
+diff --git a/apps/web/src/components/execution-jobs.tsx b/apps/web/src/components/execution-jobs.tsx
+index 0819dfd..5eebe0d 100644
+--- a/apps/web/src/components/execution-jobs.tsx
++++ b/apps/web/src/components/execution-jobs.tsx
+@@ -7,15 +7,15 @@ type Task={id:string;title:string;agentId:string};
+ type Job={id:string;taskId:string;status:string;source:string;digest:string;executionAvailable:boolean;approval:{status:string;valid:boolean;actor:string|null};contract:{task:{title:string;description:string};instructions:string;scope:{studio:string};permissions:Record<string,unknown>};result:null|{summary:string;actions:string[]};error:string|null;leaseExpired:boolean};
+ const API=executionApiOrigin(process.env.NEXT_PUBLIC_API_URL??'http://127.0.0.1:4100',typeof window==='undefined'?undefined:window.location.hostname);
+ export function ExecutionJobsPanel({tasks,reload}:{tasks:Task[];reload:()=>Promise<void>}){
+- const {t}=useLanguage(),[csrf,setCsrf]=useState(''),[password,setPassword]=useState(''),[jobs,setJobs]=useState<Job[]>([]),[error,setError]=useState(''),[busy,setBusy]=useState(false),[taskId,setTaskId]=useState(''),[title,setTitle]=useState(''),[description,setDescription]=useState(''),[studio,setStudio]=useState('HQ');const requestId=useRef<string|null>(null);
+- async function request(path:string,method='GET',body?:unknown){const response=await fetch(API+'/execution/'+path,{method,credentials:'include',headers:{...(body?{'Content-Type':'application/json'}:{}),...(method!=='GET'?{'x-creator-csrf':csrf}:{})},...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(15000)});if(!response.ok){if(response.status===401){setCsrf("");setJobs([])}const code=(await response.json()).code;throw Error(code==='OWNER_AUTH_UNCONFIGURED'?'execution.jobs.unconfigured':code==='REAL_EXECUTION_DISABLED'?'execution.jobs.locked':code==='EXECUTION_APPROVAL_STALE'?'execution.jobs.stale':'execution.jobs.error')}return response.status===204?null:response.json()}
+- async function refresh(){const data=await request('jobs');setJobs(data.jobs)}
++ const {t}=useLanguage(),[csrf,setCsrf]=useState(''),[password,setPassword]=useState(''),[jobs,setJobs]=useState<Job[]>([]),[available,setAvailable]=useState(false),[error,setError]=useState(''),[busy,setBusy]=useState(false),[taskId,setTaskId]=useState(''),[title,setTitle]=useState(''),[description,setDescription]=useState(''),[studio,setStudio]=useState('HQ');const requestId=useRef<string|null>(null);
++ async function request(path:string,method='GET',body?:unknown){const response=await fetch(API+'/execution/'+path,{method,credentials:'include',headers:{...(body?{'Content-Type':'application/json'}:{}),...(method!=='GET'?{'x-creator-csrf':csrf}:{})},...(body?{body:JSON.stringify(body)}:{}),signal:AbortSignal.timeout(15000)});if(!response.ok){if(response.status===401){setCsrf("");setJobs([]);setAvailable(false)}const code=(await response.json()).code;throw Error(code==='OWNER_AUTH_UNCONFIGURED'?'execution.jobs.unconfigured':code==='REAL_EXECUTION_DISABLED'?'execution.jobs.locked':code==='EXECUTION_APPROVAL_STALE'?'execution.jobs.stale':'execution.jobs.error')}return response.status===204?null:response.json()}
++ async function refresh(){const data=await request('jobs');setJobs(data.jobs);setAvailable(data.enabled===true)}
+  async function act(work:()=>Promise<void>){setBusy(true);setError('');try{await work()}catch(e){setError(e instanceof Error?e.message:'execution.jobs.error')}finally{setBusy(false)}}
+  useEffect(()=>{let active=true;void request('session').then(s=>{if(active)setCsrf(s.csrf)}).catch(()=>{});return()=>{active=false}},[]);
+  useEffect(()=>{if(!csrf)return;void refresh().catch(()=>setError('execution.jobs.error'));const timer=setInterval(()=>void refresh().catch(()=>setError('execution.jobs.error')),5000);return()=>clearInterval(timer)},[csrf]);
+- return <section className="panel execution-preview" data-testid="execution-jobs"><h2>{t("execution.jobs.title")}</h2><p>{t("execution.jobs.locked")}</p>{error&&<p role="alert">{t(error)}</p>}
++ return <section className="panel execution-preview" data-testid="execution-jobs"><h2>{t("execution.jobs.title")}</h2><p>{t(available?"execution.jobs.ready":"execution.jobs.locked")}</p>{error&&<p role="alert">{t(error)}</p>}
+  {!csrf?<form onSubmit={e=>{e.preventDefault();void act(async()=>{try{const session=await request('session','POST',{password});setCsrf(session.csrf)}finally{setPassword('')}})}}><label>{t("execution.jobs.ownerPassword")}<input type="password" autoComplete="current-password" minLength={12} maxLength={256} required value={password} onChange={e=>setPassword(e.target.value)}/></label><Button disabled={busy}>{t("execution.jobs.login")}</Button></form>:<>
+- <div className="actions"><span>{t("execution.jobs.ownerVerified")}</span><Button variant="outline" disabled={busy} onClick={()=>void act(refresh)}>{t("execution.jobs.refresh")}</Button><Button variant="outline" disabled={busy} onClick={()=>void act(async()=>{await request('session','DELETE');setCsrf('');setJobs([])})}>{t("execution.jobs.logout")}</Button></div>
++ <div className="actions"><span>{t("execution.jobs.ownerVerified")}</span><Button variant="outline" disabled={busy} onClick={()=>void act(refresh)}>{t("execution.jobs.refresh")}</Button><Button variant="outline" disabled={busy} onClick={()=>void act(async()=>{await request('session','DELETE');setCsrf('');setJobs([]);setAvailable(false)})}>{t("execution.jobs.logout")}</Button></div>
+  <form onSubmit={e=>{e.preventDefault();void act(async()=>{const response=await fetch(API+'/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,description,studio,agentId:'director'}),signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error('execution.jobs.error');const task=await response.json();await reload();setTaskId(task.id);requestId.current=null;setTitle('');setDescription('')})}}><h3>{t("execution.jobs.createTask")}</h3><label>{t("task.title")}<input required maxLength={160} value={title} onChange={e=>setTitle(e.target.value)}/></label><label>{t("task.description")}<textarea maxLength={5000} value={description} onChange={e=>setDescription(e.target.value)}/></label><label>{t("task.studio")}<select value={studio} onChange={e=>setStudio(e.target.value)}>{['HQ','Niko','Son Yedek'].map(s=><option key={s} value={s}>{s==='HQ'?t("studio.hq"):s}</option>)}</select></label><Button disabled={busy}>{t("execution.jobs.createTask")}</Button></form>
+  <form onSubmit={e=>{e.preventDefault();void act(async()=>{requestId.current??=crypto.randomUUID();await request('jobs','POST',{taskId,requestId:requestId.current});requestId.current=null;await refresh();await reload()})}}><label>{t("execution.existingTask")}<select required value={taskId} onChange={e=>{setTaskId(e.target.value);requestId.current=null}}><option value="">{t("execution.jobs.chooseAtlasTask")}</option>{tasks.filter(task=>task.agentId==='director').map(task=><option key={task.id} value={task.id}>{task.title}</option>)}</select></label><Button disabled={busy||!taskId}>{t("execution.jobs.requestApproval")}</Button></form>
+  {!jobs.length&&<p>{t("execution.jobs.empty")}</p>}{jobs.map(job=><article className="execution-contract" key={job.id} data-job-id={job.id}><span className="tag gold">{t(job.source==='simulation'?"execution.source.simulation":job.result?"execution.source.codex":"execution.jobs.codexIntent")}</span><h3>{job.contract.task.title}</h3><p>{t(executionStatusKey(job.status))} · {job.contract.scope.studio}</p><p>{job.contract.task.description}</p><code>{job.id}</code><details><summary>{t("execution.instructions")}</summary><pre>{job.contract.instructions}</pre><pre>{JSON.stringify(job.contract.permissions,null,2)}</pre><code>{job.digest}</code></details><p>{t(job.approval.valid?"execution.jobs.approvalValid":"execution.jobs.approvalMissing")}</p>{job.leaseExpired&&job.status==='running'&&<p role="alert">{t("execution.jobs.leaseExpired")}</p>}{job.error&&<p>{t("execution.jobs.failure",{code:job.error})}</p>}
+diff --git a/apps/web/src/app/page.tsx b/apps/web/src/app/page.tsx
+index 7cc4a8c..9d1d19c 100644
+--- a/apps/web/src/app/page.tsx
++++ b/apps/web/src/app/page.tsx
+@@ -41,7 +41,7 @@ export default function Home(){
+  const agentCards=<div className="agent-grid">{data.agents.map(a=><button key={a.id} className="agent-card" onClick={()=>setAgent(a)}><span className={'avatar '+(a.studio==='Niko'?'blue':a.studio==='HQ'?'gold':'')}>{name(a).slice(0,2)}</span><span><strong>{name(a)}</strong><small>{role(a.role)}</small><em>{a.studio==='Niko'?'Afterlight Stories / Niko':studioName(a.studio)}</em></span><span className={'dot '+(!a.enabled?'off':'')} role="img" aria-label={t(a.enabled?"copy.enabled":"copy.disabled_75081b")} title={t(a.enabled?"copy.enabled":"copy.disabled_75081b")}/></button>)}</div>;
+  const board=<><div className="toolbar"><div className="tabs">{['All',...studios].map(s=><button className={filter===s?'selected':''} onClick={()=>setFilter(s)} key={s}>{s==='All'?t("copy.allStudios"):studioName(s)}</button>)}</div><Button disabled={!connected} onClick={()=>setTask({...blank})}><Plus size={16}/>{t("copy.newTask")}</Button></div><div className="board">{statuses.map(s=><section className="column" key={s}><h3><Circle size={12}/> {t(statusKey(s))}<span>{n(visible.filter(t=>t.status===s).length)}</span></h3>{visible.filter(t=>t.status===s).map(item=><button className="task" key={item.id} onClick={()=>setTask({...item})}><span className={'tag '+(item.studio==='Niko'?'blue':'')}>{studioName(item.studio)}</span><strong>{item.title}</strong><p>{item.description||t("copy.noDescription")}</p><small>{name(data.agents.find(a=>a.id===item.agentId))} <ArrowUpRight size={14}/></small></button>)}{!visible.some(t=>t.status===s)&&<div className="column-empty">{t("copy.noTasksYet")}</div>}</section>)}</div></>;
+  const history=(events:Event[])=><div className="history">{events.length?events.map(e=><div key={e.id}><span className="event-dot"/><section><strong>{name(data.agents.find(a=>a.id===e.agentId))}</strong><p>{localizedActivity(e.message,t)}</p><small>{e.simulated?t("copy.simulation"):''}{formatDate(e.createdAt,locale)}</small></section></div>):<div className="empty">{t("copy.noActivityRecordedCreateATaskOrExplicitly")}</div>}</div>;
+- return <div className="shell">{mobile&&<button className="mobile-backdrop" aria-label={t("copy.closeNavigation")} onClick={()=>setMobile(false)}/>}<aside aria-hidden={Boolean(task||agent)} className={mobile?'open':''}><a className="brand" href="/" aria-label={t("copy.creatorHQHome")}><span className="logo">C<span>↗</span></span><div>CREATOR<span>{t("copy.hqLOCALWORKSPACE")}</span></div></a><div className="workspace"><span className="workspace-icon">CH</span><div>{t("copy.creatorHeadquarters")}<small>{t("copy.personalWorkspace")}</small></div><span className="dot"/></div><p className="eyebrow nav-caption">{t("sidebar.workspaceLabel")}</p><nav>{nav.map(([label,Icon])=><button className={page===label?'active':''} key={label} onClick={()=>{setPage(label);setMobile(false)}}><Icon size={18}/>{t(pageKey(label))}{label==='Approvals'&&pending>0&&<b>{n(pending)}</b>}</button>)}</nav><div className="local-card"><span className="dot"/>{t("copy.localFirstByDesign")}<p>{t("copy.yourIdeasStayOnYourMachine")}<br/>{t("copy.executionIntegrationsAreDisabled")}</p><small>{t("copy.phase01FOUNDATION")}</small></div><div className="profile"><span className="avatar gold">Y</span><div>{t("copy.yourWorkspace")}<small>{t("copy.ownerCEO")}</small></div></div></aside><main aria-hidden={Boolean(task||agent)}><header><div><Button variant="outline" className="mobile-menu" aria-expanded={mobile} onClick={()=>setMobile(!mobile)} aria-label={t("copy.toggleNavigation")}><Menu size={18}/></Button><span>{t("common.workspace")}<span className="muted">/</span> <strong>{t(pageKey(page))}</strong></span></div><div className="header-tools"><LanguageSwitcher/><span className="connection"><span className={'dot '+(!connected?'off':'')}/>{connected?t("copy.localAPIConnected"):t("copy.apiDisconnected")}</span></div></header><div className="content"><div className="page-heading"><div><p className="eyebrow">CREATOR HQ <span>{t("copy.phase01")}</span></p><h1>{t(page==='Overview'?"copy.goodIdeasStartHere":pageKey(page))}</h1><p>{t(heading[page])}</p></div><Button variant="outline" disabled={busy||!connected} onClick={()=>void mutate('/simulate','POST')}><Activity size={16}/>{t("copy.runSimulation")}</Button></div><div className="notice"><ShieldCheck size={16}/><span>{t("copy.localWorkspaceHumanApprovalRequiredAllIntegrationsDisabled")}</span></div>{error&&<div role="alert" className="error">{t(error)}{errorCode&&<code>{t("copy.errorCodeCode",{code:errorCode})}</code>}<Button variant="outline" onClick={()=>{setError('');void reload()}}>{t("copy.retryConnection")}</Button></div>}
++ return <div className="shell">{mobile&&<button className="mobile-backdrop" aria-label={t("copy.closeNavigation")} onClick={()=>setMobile(false)}/>}<aside aria-hidden={Boolean(task||agent)} className={mobile?'open':''}><a className="brand" href="/" aria-label={t("copy.creatorHQHome")}><span className="logo">C<span>↗</span></span><div>CREATOR<span>{t("copy.hqLOCALWORKSPACE")}</span></div></a><div className="workspace"><span className="workspace-icon">CH</span><div>{t("copy.creatorHeadquarters")}<small>{t("copy.personalWorkspace")}</small></div><span className="dot"/></div><p className="eyebrow nav-caption">{t("sidebar.workspaceLabel")}</p><nav>{nav.map(([label,Icon])=><button className={page===label?'active':''} key={label} onClick={()=>{setPage(label);setMobile(false)}}><Icon size={18}/>{t(pageKey(label))}{label==='Approvals'&&pending>0&&<b>{n(pending)}</b>}</button>)}</nav><div className="local-card"><span className="dot"/>{t("copy.localFirstByDesign")}<p>{t("copy.yourIdeasStayOnYourMachine")}<br/>{t("execution.jobs.gatedExecution")}</p><small>{t("copy.phase01FOUNDATION")}</small></div><div className="profile"><span className="avatar gold">Y</span><div>{t("copy.yourWorkspace")}<small>{t("copy.ownerCEO")}</small></div></div></aside><main aria-hidden={Boolean(task||agent)}><header><div><Button variant="outline" className="mobile-menu" aria-expanded={mobile} onClick={()=>setMobile(!mobile)} aria-label={t("copy.toggleNavigation")}><Menu size={18}/></Button><span>{t("common.workspace")}<span className="muted">/</span> <strong>{t(pageKey(page))}</strong></span></div><div className="header-tools"><LanguageSwitcher/><span className="connection"><span className={'dot '+(!connected?'off':'')}/>{connected?t("copy.localAPIConnected"):t("copy.apiDisconnected")}</span></div></header><div className="content"><div className="page-heading"><div><p className="eyebrow">CREATOR HQ <span>{t("copy.phase01")}</span></p><h1>{t(page==='Overview'?"copy.goodIdeasStartHere":pageKey(page))}</h1><p>{t(heading[page])}</p></div><Button variant="outline" disabled={busy||!connected} onClick={()=>void mutate('/simulate','POST')}><Activity size={16}/>{t("copy.runSimulation")}</Button></div><div className="notice"><ShieldCheck size={16}/><span>{t("execution.jobs.globalBoundary")}</span></div>{error&&<div role="alert" className="error">{t(error)}{errorCode&&<code>{t("copy.errorCodeCode",{code:errorCode})}</code>}<Button variant="outline" onClick={()=>{setError('');void reload()}}>{t("copy.retryConnection")}</Button></div>}
+  {page==='Overview'&&<><div className="stats">{[["copy.configuredAgents",data.agents.length,"dashboard.agentProfilesHelp",Users],["copy.openTasks",data.tasks.filter(t=>t.status!=='Done').length,"copy.acrossBothStudios",ListTodo],["report.status.awaitingApproval",pending,"copy.humanDecisionsOnly",ShieldCheck],["copy.completedTasks",data.tasks.filter(t=>t.status==='Done').length,"copy.localBoardRecords",CheckCircle2]].map(([label,note,sub,Icon])=>{const I=Icon as typeof Users;return <div className="stat" key={String(label)}><div>{t(String(label))}<I size={17}/></div><strong>{n(Number(note))}</strong><small>{t(String(sub))}</small></div>})}</div><div className="section-head"><div><h2>{t("copy.theOffice")}</h2><p>{t("copy.threeRoomsTwoStudiosOneCreativeDirection")}</p></div><button className="text-button" onClick={()=>setPage('Office')}>{t("copy.exploreOffice")}<ArrowUpRight size={16}/></button></div><div className="office"><Office onSelect={selectAgent}/><span className="office-label"><span className="dot"/>{t("copy.interactiveOFFICEDragToOrbitClickASeat")}</span></div><div className="studio-grid"><div className="studio blue-studio"><span className="eyebrow">{t("copy.studio01YOUTUBESHORTS")}</span><h2>Afterlight Stories <span>/ Niko</span></h2><p>{t("copy.cinematicStoriesALittleAfterDark")}</p><button onClick={()=>{setFilter('Niko');setPage('Task board')}}>{t("copy.openStudioBoard")}<ArrowUpRight size={17}/></button></div><div className="studio green-studio"><span className="eyebrow">{t("copy.studio02INSTAGRAMREELS")}</span><h2>Son Yedek</h2><p>{t("copy.aDistinctVoiceADedicatedProductionSpace")}</p><button onClick={()=>{setFilter('Son Yedek');setPage('Task board')}}>{t("copy.openStudioBoard")}<ArrowUpRight size={17}/></button></div></div><div className="section-head"><h2>{t("copy.recentActivity")}</h2><span className="muted">{t("copy.recordedLocally")}</span></div>{history(data.activity.slice(0,5))}<Reports reports={(data.reports??[]).slice(0,5)}/></>}
+  {page==='Office'&&<><div className="office large"><Office onSelect={selectAgent}/><span className="office-label">{t("copy.dragToOrbitScrollToZoomClickA")}</span></div><div className="section-head"><h2>{t("copy.agentDirectory")}</h2><span className="muted">{t("copy.accessibleAlternativeToThe3DOffice")}</span></div>{agentCards}</>}
+  {page==='Task board'&&board}
+diff --git a/apps/web/src/locales/en-US.json b/apps/web/src/locales/en-US.json
+index bce8bec..6082dd7 100644
+--- a/apps/web/src/locales/en-US.json
++++ b/apps/web/src/locales/en-US.json
+@@ -282,5 +282,8 @@
+   "execution.jobs.result": "Recorded result",
+   "execution.jobs.reportActions": "Recorded text result",
+   "execution.jobs.reportWarning": "Text output only. Review the recorded result before taking any further action.",
+-  "execution.jobs.approvalRecorded": "This job used a recorded human approval. Further actions need separate review."
++  "execution.jobs.approvalRecorded": "This job used a recorded human approval. Further actions need separate review.",
++  "execution.jobs.ready": "Only approved Atlas text jobs can start. Tools and publishing remain disabled.",
++  "execution.jobs.globalBoundary": "Local workspace · human approval required · no automatic publishing",
++  "execution.jobs.gatedExecution": "Agent execution requires a reviewed release and owner approval."
+ }
+diff --git a/apps/web/src/locales/tr-TR.json b/apps/web/src/locales/tr-TR.json
+index 9743ab4..dc8a993 100644
+--- a/apps/web/src/locales/tr-TR.json
++++ b/apps/web/src/locales/tr-TR.json
+@@ -282,5 +282,8 @@
+   "execution.jobs.result": "Kaydedilmiş sonuç",
+   "execution.jobs.reportActions": "Kaydedilmiş metin sonucu",
+   "execution.jobs.reportWarning": "Yalnızca metin çıktısıdır. Sonraki işlemden önce kaydedilmiş sonucu inceleyin.",
+-  "execution.jobs.approvalRecorded": "Bu iş kayıtlı insan onayıyla yürütüldü. Sonraki işlemler ayrıca inceleme gerektirir."
++  "execution.jobs.approvalRecorded": "Bu iş kayıtlı insan onayıyla yürütüldü. Sonraki işlemler ayrıca inceleme gerektirir.",
++  "execution.jobs.ready": "Yalnızca onaylı Atlas metin işleri başlatılabilir. Araçlar ve yayınlama kapalıdır.",
++  "execution.jobs.globalBoundary": "Yerel çalışma alanı · insan onayı gerekli · otomatik yayınlama yok",
++  "execution.jobs.gatedExecution": "Ajan yürütmesi incelenmiş sürüm ve sahip onayı gerektirir."
+ }
+diff --git a/apps/api/src/execution/release.ts b/apps/api/src/execution/release.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/api/src/execution/release.ts
+@@ -0,0 +1,2 @@
++// REVIEW GATE: operator-approved release edit only. Never an environment/HTTP switch.
++export const NATIVE_EXECUTION_RELEASE_APPROVED:boolean=false;
+diff --git a/apps/api/src/execution/prepare-runtime.ts b/apps/api/src/execution/prepare-runtime.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/api/src/execution/prepare-runtime.ts
+@@ -0,0 +1,28 @@
++import {createReadStream,existsSync,lstatSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
++import {createInterface} from 'node:readline';
++import {homedir} from 'node:os';
++import {resolve,dirname,join} from 'node:path';
++import {fileURLToPath} from 'node:url';
++import {assertNormalWindowsUser,assertPrivateOwnerDirectory,loadRuntimeSettings} from './windows-host.js';
++export function integrationHeader(line:string):{kind:'mcp_servers'|'plugins';id:string}|null{
++ if(!/^\s*\[\s*(mcp_servers|plugins)\./.test(line))return null;
++ const match=line.match(/^\s*\[\s*(mcp_servers|plugins)\.("(?:[^"\\]|\\.)*"|'[^']*'|[-A-Za-z0-9_@]+)(\.env)?\s*\]\s*(?:#.*)?$/);
++ if(!match)throw Error('INTEGRATION_INVENTORY_REVIEW_REQUIRED');
++ if(match[3]&&match[1]!=='mcp_servers')throw Error('INTEGRATION_INVENTORY_REVIEW_REQUIRED');
++ const id=match[2].startsWith('"')?JSON.parse(match[2]):match[2].startsWith("'")?match[2].slice(1,-1):match[2];if(!/^[-A-Za-z0-9_@]{1,200}$/.test(id))throw Error('INTEGRATION_INVENTORY_REVIEW_REQUIRED');
++ return {kind:match[1] as 'mcp_servers'|'plugins',id};
++}
++async function main(){
++ if(process.argv.length!==3||process.argv[2]!=='--prepare-only')throw Error('PREPARATION_ONLY_REQUIRED');assertNormalWindowsUser();
++ const root=resolve(dirname(fileURLToPath(import.meta.url)),'../../../..'),owner=join(root,'.local/owner-auth');assertPrivateOwnerDirectory(owner);
++ const file=join(owner,'codex-runtime.json'),scratch=join(owner,'jobs');if(existsSync(file)||existsSync(scratch))throw Error('PRIVATE_CONFIGURATION_ALREADY_EXISTS');
++ const home=process.env.CODEX_HOME||join(homedir(),'.codex');const prior=JSON.parse(readFileSync(join(root,'.local/phase20-trial/preflight-location.json'),'utf8'));
++ if(typeof prior.bin!=='string'||!/[\\/]codex\.exe$/i.test(prior.bin)||!lstatSync(prior.bin).isFile())throw Error('REVIEWED_NATIVE_BINARY_REQUIRED');
++ const ids={mcp_servers:new Set<string>(),plugins:new Set<string>()};
++ // Only section headers are interpreted; values and authentication files are never inspected.
++ const lines=createInterface({input:createReadStream(join(home,'config.toml')),crlfDelay:Infinity});for await(const line of lines){if(line.length>32768)throw Error('INTEGRATION_INVENTORY_REVIEW_REQUIRED');const entry=integrationHeader(line);if(entry)ids[entry.kind].add(entry.id)}
++ const config={codexExecutable:prior.bin,scratchRoot:scratch,codexHome:home,nodeExecutable:process.execPath,mcpIds:[...ids.mcp_servers].sort(),pluginIds:[...ids.plugins].sort(),systemRoot:process.env.SystemRoot,userProfile:process.env.USERPROFILE,expectedVersion:'0.166.0'};
++ mkdirSync(scratch);writeFileSync(file,JSON.stringify(config,null,2)+'\n',{flag:'wx',mode:0o600});loadRuntimeSettings(file,root);
++ process.stdout.write(JSON.stringify({runtimeConfigurationPrepared:true,mcpRecords:config.mcpIds.length,pluginRecords:config.pluginIds.length,authenticationFilesRead:0,cliLaunches:0,executionEnabled:false})+'\n');
++}
++if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(()=>{process.stderr.write('RUNTIME_PREPARATION_STOPPED: Gizli değerler gösterilmedi; mevcut yapılandırma değiştirilmedi.\n');process.exitCode=1});
+diff --git a/apps/api/src/database/migration-history.ts b/apps/api/src/database/migration-history.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/api/src/database/migration-history.ts
+@@ -0,0 +1,32 @@
++import {readFileSync,readdirSync} from 'node:fs';
++import {join} from 'node:path';
++import {createHash} from 'node:crypto';
++// Reviewed byte checksums. Additional migrations require a new review.
++export const reviewedMigrations=[
++  {
++    "name": "20261106000100_phase12_initial",
++    "checksum": "8edd3dd1f2b5d9e9f949c3c2abad73a1504a8b79e1539706ccb1f4a942410d2a"
++  },
++  {
++    "name": "20261107000100_phase20_atlas_text",
++    "checksum": "5df629368ffe9ff3a49d47333efd115ef67f327d345a62ba18911142c9eefdb4"
++  },
++  {
++    "name": "20261107000200_phase20_atlas_disable",
++    "checksum": "bd5c3d54873f0a1d32e649b3fadbd6c26052f44d8f8eddd8a274a5abc05780b8"
++  }
++] as const;
++export function assertReviewedMigrationHistory(rows:readonly {migration_name:string;checksum:string;finished_at:unknown;rolled_back_at:unknown}[]){
++ const names=new Set<string>();for(const row of rows){const index=reviewedMigrations.findIndex(m=>m.name===row.migration_name);if(index<0||names.has(row.migration_name)||row.checksum!==reviewedMigrations[index].checksum||!row.finished_at||row.rolled_back_at)throw Error('MIGRATION_HISTORY_REVIEW_REQUIRED');names.add(row.migration_name);}
++ for(let i=0;i<reviewedMigrations.length;i++)if(names.has(reviewedMigrations[i].name)&&reviewedMigrations.slice(0,i).some(m=>!names.has(m.name)))throw Error('MIGRATION_HISTORY_REVIEW_REQUIRED');
++}
++export function assertReviewedMigrationFiles(directory:string){
++ const found=new Set<string>();
++ for(const entry of readdirSync(directory,{withFileTypes:true})){
++  if(entry.isFile()&&entry.name==='migration_lock.toml')continue;
++  if(!entry.isDirectory())throw Error('MIGRATION_FILES_REVIEW_REQUIRED');
++  const expected=reviewedMigrations.find(m=>m.name===entry.name);if(!expected)throw Error('MIGRATION_FILES_REVIEW_REQUIRED');
++  const checksum=createHash('sha256').update(readFileSync(join(directory,entry.name,'migration.sql'))).digest('hex');if(checksum!==expected.checksum)throw Error('MIGRATION_FILES_REVIEW_REQUIRED');found.add(entry.name);
++ }
++ if(!found.has(reviewedMigrations[0].name)||reviewedMigrations.some((m,i)=>found.has(m.name)&&reviewedMigrations.slice(0,i).some(prior=>!found.has(prior.name))))throw Error('MIGRATION_FILES_REVIEW_REQUIRED');
++}

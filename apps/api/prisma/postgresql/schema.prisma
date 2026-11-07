@@ -1,0 +1,136 @@
+generator client {
+ provider = "prisma-client-js"
+ output = "../../generated/postgresql"
+}
+datasource db {
+ provider = "postgresql"
+ url = env("DATABASE_URL")
+ directUrl = env("DIRECT_URL")
+ schemas = ["creator_hq"]
+}
+model Studio {
+ id String @id
+ name String
+ agents Agent[]
+ tasks Task[]
+ settings StudioSettings?
+ @@schema("creator_hq")
+}
+model Agent {
+ id String @id
+ name String
+ role String
+ studio String
+ instructions String @default("")
+ enabled Boolean @default(true)
+ studioRecord Studio @relation(fields:[studio],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ tasks Task[]
+ activities Activity[]
+ approvals Approval[]
+ reports AgentReport[]
+ jobs ExecutionJob[]
+ @@index([studio])
+ @@schema("creator_hq")
+}
+model Task {
+ id String @id @default(cuid())
+ title String
+ description String @default("")
+ studio String
+ status String @default("Backlog")
+ priority String @default("Normal")
+ agentId String
+ createdAt DateTime @default(now()) @db.Timestamptz(3)
+ updatedAt DateTime @updatedAt @db.Timestamptz(3)
+ agent Agent @relation(fields:[agentId],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ studioRecord Studio @relation(fields:[studio],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ reports AgentReport[]
+ artifacts ArtifactReference[]
+ jobs ExecutionJob[]
+ @@index([studio,status])
+ @@index([agentId,createdAt])
+ @@schema("creator_hq")
+}
+model Activity {
+ id String @id @default(cuid())
+ agentId String
+ message String
+ simulated Boolean @default(false)
+ createdAt DateTime @default(now()) @db.Timestamptz(3)
+ agent Agent @relation(fields:[agentId],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ @@index([agentId,createdAt])
+ @@schema("creator_hq")
+}
+model Approval {
+ id String @id @default(cuid())
+ title String
+ agentId String
+ status String @default("Pending")
+ simulated Boolean @default(true)
+ createdAt DateTime @default(now()) @db.Timestamptz(3)
+ agent Agent @relation(fields:[agentId],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ reports AgentReport[]
+ @@index([status,createdAt])
+ @@index([agentId])
+ @@schema("creator_hq")
+}
+model StudioSettings {
+ id String @id
+ contentLanguage String
+ studioRecord Studio @relation(fields:[id],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ @@schema("creator_hq")
+}
+model AgentReport {
+ id String @id @default(cuid())
+ sourceId String @unique
+ agentId String
+ taskId String?
+ approvalId String?
+ source String
+ status String
+ summaryData String
+ originalTechnicalReport String
+ createdAt DateTime @default(now()) @db.Timestamptz(3)
+ agent Agent @relation(fields:[agentId],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ task Task? @relation(fields:[taskId],references:[id],onDelete:SetNull,onUpdate:Restrict)
+ approval Approval? @relation(fields:[approvalId],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ @@index([agentId,createdAt])
+ @@index([taskId])
+ @@index([approvalId])
+ @@schema("creator_hq")
+}
+model ApplicationSetting {
+ id String @id
+ value Json
+ updatedAt DateTime @updatedAt @db.Timestamptz(3)
+ @@schema("creator_hq")
+}
+model ArtifactReference {
+ id String @id @default(cuid())
+ taskId String?
+ storageRoot String
+ relativePath String
+ mediaType String?
+ sha256 String? @db.Char(64)
+ createdAt DateTime @default(now()) @db.Timestamptz(3)
+ task Task? @relation(fields:[taskId],references:[id],onDelete:SetNull,onUpdate:Restrict)
+ @@index([taskId])
+ @@unique([storageRoot,relativePath])
+ @@schema("creator_hq")
+}
+model ExecutionJob {
+ id String @id @default(cuid())
+ taskId String
+ agentId String
+ status String @default("planned")
+ enabled Boolean @default(false)
+ metadata Json @default("{}")
+ createdAt DateTime @default(now()) @db.Timestamptz(3)
+ updatedAt DateTime @updatedAt @db.Timestamptz(3)
+ task Task @relation(fields:[taskId],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ agent Agent @relation(fields:[agentId],references:[id],onDelete:Restrict,onUpdate:Restrict)
+ @@index([status,createdAt])
+ @@index([taskId])
+ @@index([agentId])
+ @@schema("creator_hq")
+}

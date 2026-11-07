@@ -1,0 +1,58 @@
+generator client {
+ provider = "prisma-client-js"
+}
+datasource db {
+ provider = "sqlite"
+ url = env("DATABASE_URL")
+}
+model Agent {
+ id String @id
+ name String
+ role String
+ studio String
+ instructions String @default("")
+ enabled Boolean @default(true)
+}
+model Task {
+ id String @id @default(cuid())
+ title String
+ description String @default("")
+ studio String
+ status String @default("Backlog")
+ agentId String
+ createdAt DateTime @default(now())
+ updatedAt DateTime @updatedAt
+}
+model Activity {
+ id String @id @default(cuid())
+ agentId String
+ message String
+ simulated Boolean @default(false)
+ createdAt DateTime @default(now())
+}
+model Approval {
+ id String @id @default(cuid())
+ title String
+ agentId String
+ status String @default("Pending")
+ simulated Boolean @default(true)
+ createdAt DateTime @default(now())
+}
+
+// Additive Phase 1.1 tables. Existing records and enum strings remain unchanged.
+model StudioSettings {
+ id String @id
+ contentLanguage String
+}
+model AgentReport {
+ id String @id @default(cuid())
+ sourceId String @unique
+ agentId String
+ taskId String?
+ approvalId String?
+ source String
+ status String
+ summaryData String
+ originalTechnicalReport String
+ createdAt DateTime @default(now())
+}

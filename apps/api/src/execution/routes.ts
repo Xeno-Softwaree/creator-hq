@@ -1,0 +1,20 @@
+import type {FastifyInstance,FastifyRequest} from 'fastify';
+import {z} from 'zod';
+import {OwnerSessions} from './owner.js';
+import {ExecutionJobs,JobFailure} from './jobs.js';
+export async function executionRoutes(app:FastifyInstance,jobs:ExecutionJobs|null,passwordHash?:string){
+ const sessions=new OwnerSessions(passwordHash),cookie='creator_owner=';
+ function error(reply:any,e:unknown){if(e instanceof JobFailure)return reply.code(e.status).send({code:e.code});const code=e instanceof Error?e.message:'';const known=['OWNER_AUTH_UNCONFIGURED','OWNER_AUTH_RATE_LIMITED','OWNER_AUTH_FAILED','OWNER_AUTH_REQUIRED','OWNER_CSRF_INVALID'];if(known.includes(code))return reply.code(code==='OWNER_AUTH_UNCONFIGURED'?503:code==='OWNER_AUTH_RATE_LIMITED'?429:401).send({code});throw e;}
+ function owner(req:FastifyRequest,mutation=false){return sessions.authenticate(req.headers.cookie,typeof req.headers['x-creator-csrf']==='string'?req.headers['x-creator-csrf']:undefined,mutation).owner;}
+ app.addHook('onRequest',async(req,reply)=>{if(!req.url.startsWith('/execution/session')&&!req.url.startsWith('/execution/jobs'))return;const host=req.headers.host?.split(':')[0];if(host&&!['127.0.0.1','localhost'].includes(host))return reply.code(403).send({code:'OWNER_ORIGIN_INVALID'});if(['POST','PATCH','DELETE'].includes(req.method)&&!['http://127.0.0.1:3000','http://localhost:3000'].includes(req.headers.origin??''))return reply.code(403).send({code:'OWNER_ORIGIN_INVALID'});});
+ app.post('/execution/session',async(req,reply)=>{const parsed=z.object({password:z.string().min(12).max(256)}).strict().safeParse(req.body);if(!parsed.success)return reply.code(400).send({code:'OWNER_AUTH_FAILED'});try{const session=sessions.login(parsed.data.password,req.ip);reply.header('set-cookie',cookie+session.token+'; HttpOnly; SameSite=Strict; Path=/execution; Max-Age=3600');return {authenticated:true,csrf:session.csrf}}catch(e){return error(reply,e)}});
+ app.get('/execution/session',async(req,reply)=>{try{const session=sessions.authenticate(req.headers.cookie);return {authenticated:true,csrf:session.csrf}}catch(e){return error(reply,e)}});
+ app.delete('/execution/session',async(req,reply)=>{try{owner(req,true);sessions.logout(req.headers.cookie);reply.header('set-cookie',cookie+'; HttpOnly; SameSite=Strict; Path=/execution; Max-Age=0');return {authenticated:false}}catch(e){return error(reply,e)}});
+ const store=()=>{if(!jobs)throw new JobFailure('EXECUTION_POSTGRES_REQUIRED',503);return jobs;};
+ app.get('/execution/jobs',async(req,reply)=>{try{owner(req);return {enabled:await store().availability(),jobs:await store().list()}}catch(e){return error(reply,e)}});
+ app.get('/execution/jobs/:id',async(req,reply)=>{try{owner(req);return await store().get(z.string().uuid().parse((req.params as any).id))}catch(e){return error(reply,e)}});
+ app.post('/execution/jobs',async(req,reply)=>{const p=z.object({taskId:z.string().min(1).max(100),requestId:z.string().uuid()}).strict().safeParse(req.body);if(!p.success)return reply.code(400).send({code:'EXECUTION_INPUT_INVALID'});try{const actor=owner(req,true);const result=await store().create(p.data.taskId,p.data.requestId,actor);return reply.code(201).send(result)}catch(e){return error(reply,e)}});
+ app.post('/execution/jobs/:id/decision',async(req,reply)=>{const p=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),decision:z.enum(['Approved','Rejected'])}).strict().safeParse(req.body);if(!p.success)return reply.code(400).send({code:'EXECUTION_INPUT_INVALID'});try{return await store().decide(z.string().uuid().parse((req.params as any).id),p.data.digest,p.data.decision,owner(req,true))}catch(e){return error(reply,e)}});
+ app.post('/execution/jobs/:id/cancel',async(req,reply)=>{try{return await store().cancel(z.string().uuid().parse((req.params as any).id),owner(req,true))}catch(e){return error(reply,e)}});
+ app.post('/execution/jobs/:id/start',async(req,reply)=>{try{owner(req,true);return await store().run(z.string().uuid().parse((req.params as any).id))}catch(e){return error(reply,e)}});
+}

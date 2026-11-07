@@ -1,0 +1,3 @@
+import 'dotenv/config';
+import {backupSqlite} from './snapshot.js';
+try{if(!process.env.BACKUP_DIR)throw new Error('BACKUP_DIR_REQUIRED');const result=await backupSqlite(process.env.SQLITE_SOURCE_PATH??'prisma/creator.db',process.env.BACKUP_DIR);console.log('SQLite yedeği oluşturuldu ve okunarak doğrulandı.');console.log(JSON.stringify({backupPath:result.path,manifestPath:result.manifestPath,counts:result.snapshot.counts,fingerprint:result.snapshot.fingerprint},null,2));}catch{console.error('SQLITE_BACKUP_FAILED: Yedek oluşturulamadı veya doğrulanamadı. Özgün veritabanı değiştirilmedi.');process.exitCode=1}

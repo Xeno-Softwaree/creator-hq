@@ -1,0 +1,34 @@
+{
+  "name": "creator-hq",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k \"npm run dev -w @creator/api\" \"npm run dev -w @creator/web\"",
+    "build": "npm run build -w @creator/api && npm run build -w @creator/web",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "npm run test --workspaces && node --test scripts/*.test.mjs",
+    "db:setup": "npm run db:setup -w @creator/api",
+    "start": "concurrently -k \"npm run start -w @creator/api\" \"npm run start -w @creator/web\"",
+    "audit:public": "node scripts/public-audit.mjs",
+    "db:generate": "npm run db:generate -w @creator/api",
+    "db:backup:sqlite": "npm run db:backup:sqlite -w @creator/api",
+    "db:migrate": "npm run db:migrate -w @creator/api --",
+    "db:inspect": "npm run db:inspect -w @creator/api",
+    "db:backup:postgres": "npm run db:backup:postgres -w @creator/api --",
+    "db:fix-runtime-password": "npm run db:fix-runtime-password -w @creator/api --"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  },
+  "version": "0.1.0",
+  "overrides": {
+    "next@15.5.29": {
+      "postcss": "8.5.32"
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
